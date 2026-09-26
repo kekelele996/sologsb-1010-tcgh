@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, captureApprovalBasis, makeRule, outputText, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofIssue, ProjectState, RecheckReason, RuleSet, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -91,6 +91,35 @@ function issueLabel(issue: ProofIssue): string {
   if (issue.severity === 'error') return '阻断';
   if (issue.severity === 'warning') return '可疑';
   return '建议';
+}
+
+function statusLabel(status: TextbookLine['status']): string {
+  if (status === 'approved') return '已批准';
+  if (status === 'recheck') return '待复核';
+  if (status === 'reviewed') return '已校对';
+  if (status === 'questionable') return '待核对';
+  return '未检查';
+}
+
+const RECHECK_REASON_LABEL: Record<RecheckReason, string> = {
+  'source-rule': '原规则变化',
+  output: '输出变化',
+  toggle: '启停变化',
+  'source-text': '原文变化',
+};
+
+function recheckReasonLabel(reason: RecheckReason): string {
+  return RECHECK_REASON_LABEL[reason];
+}
+
+/** 用当前规则集查找规则来源；已删除规则回退到批准依据里的快照 */
+function ruleSourceLabel(ruleId: string, ruleSets: RuleSet[], activeSetId: string, line?: TextbookLine): string {
+  const activeSet = ruleSets.find((set) => set.id === activeSetId) ?? ruleSets[0];
+  const current = activeSet?.rules.find((rule) => rule.id === ruleId);
+  if (current) return current.source || '数字符';
+  const recorded = line?.approvalBasis?.usedRules.find((rule) => rule.id === ruleId);
+  if (recorded) return `${recorded.source || '规则'}（已删除）`;
+  return '已删除规则';
 }
 
 function Section({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ComponentChildren; children: ComponentChildren }) {
@@ -215,6 +244,8 @@ function LineCard({
   index,
   selected,
   issues,
+  ruleSets,
+  activeRuleSetId,
   onSelect,
   onChange,
   onNote,
@@ -225,6 +256,8 @@ function LineCard({
   index: number;
   selected: boolean;
   issues: ProofIssue[];
+  ruleSets: RuleSet[];
+  activeRuleSetId: string;
   onSelect: () => void;
   onChange: (source: string) => void;
   onNote: (note: string) => void;
@@ -233,12 +266,18 @@ function LineCard({
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const isRecheck = line.status === 'recheck';
+  const basis = line.approvalBasis;
+  const approvalRuleSet = basis ? ruleSets.find((set) => set.id === basis.ruleSetId) : undefined;
+  const basisTitle = basis
+    ? `批准依据：${approvalRuleSet?.name ?? '已删除规则集'} · ${formatTime(basis.approvedAt)}\n依据规则：${basis.usedRules.map((rule) => rule.source).join('、') || '无显式规则'}`
+    : '';
 
   return (
-    <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
+    <article class={`line-card ${selected ? 'selected' : ''} ${isRecheck ? 'recheck' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
-        <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        <span class={`line-status ${line.status}`} title={`状态：${statusLabel(line.status)}`} />
       </div>
       <div class="line-body">
         <div class="line-source">
@@ -256,6 +295,26 @@ function LineCard({
             <md-icon-button aria-label="删除此行" title="删除此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onDelete(); }}>×</md-icon-button>
           </div>
         </div>
+        {isRecheck && basis && (
+          <div class="recheck-banner">
+            <div class="recheck-reasons">
+              <span class="recheck-flag">规则变更后结果已变 · 待复核</span>
+              {(line.recheckReasons ?? []).map((reason) => (
+                <span class={`recheck-chip ${reason}`} key={reason}>{recheckReasonLabel(reason)}</span>
+              ))}
+              {(line.recheckRuleIds ?? []).slice(0, 4).map((ruleId) => (
+                <span class="recheck-rule" key={ruleId}>{ruleSourceLabel(ruleId, ruleSets, activeRuleSetId, line)}</span>
+              ))}
+            </div>
+            <div class="recheck-braille" title="批准时的盲文结果">
+              <small>批准时盲文</small>
+              <span class="old-braille">{basis.braille || '（空行）'}</span>
+            </div>
+            <md-filled-tonal-button onClick={(event: MouseEvent) => { event.stopPropagation(); onStatus('approved'); }}>
+              结果正确，重新批准
+            </md-filled-tonal-button>
+          </div>
+        )}
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
           {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
           {line.tokens.map((token) => (
@@ -275,6 +334,12 @@ function LineCard({
             {lineIssues.slice(0, 3).map((item) => (
               <span class={`issue-chip ${item.severity}`} key={item.id}>{issueLabel(item)} · {item.message}</span>
             ))}
+          </div>
+        )}
+        {line.status === 'approved' && basis && (
+          <div class="approval-basis" title={basisTitle}>
+            <span class="basis-dot" aria-hidden="true">★</span>
+            已按 {approvalRuleSet?.name ?? '原规则集'} 批准 · {formatTime(basis.approvedAt)} · 依据 {basis.usedRules.length} 条规则
           </div>
         )}
         {selected && (
@@ -362,6 +427,8 @@ function EditorPanel({
             index={index}
             selected={state.selectedLineId === line.id}
             issues={state.issues}
+            ruleSets={state.ruleSets}
+            activeRuleSetId={state.activeRuleSetId}
             onSelect={() => onSelectLine(line.id)}
             onChange={(source) => onChangeLine(line.id, source)}
             onNote={(note) => onNote(line.id, note)}
@@ -374,20 +441,98 @@ function EditorPanel({
   );
 }
 
+function RecheckSummary({
+  lines,
+  ruleSets,
+  activeRuleSetId,
+  onJump,
+}: {
+  lines: TextbookLine[];
+  ruleSets: RuleSet[];
+  activeRuleSetId: string;
+  onJump: (lineId: string) => void;
+}) {
+  const recheckLines = lines.filter((line) => line.status === 'recheck');
+  if (recheckLines.length === 0) return null;
+
+  // 按“规则 × 原因类别”聚合本轮受影响的行；没有规则 id 的（原文变化）单独成组
+  type Bucket = { key: string; ruleId?: string; reason: RecheckReason; lineIds: string[] };
+  const buckets = new Map<string, Bucket>();
+  const reasonOrder: RecheckReason[] = ['source-rule', 'output', 'toggle', 'source-text'];
+
+  for (const line of recheckLines) {
+    const reasons = line.recheckReasons?.length ? line.recheckReasons : (['source-text'] as RecheckReason[]);
+    const ruleIds = line.recheckRuleIds ?? [];
+    for (const reason of reasonOrder) {
+      if (!reasons.includes(reason)) continue;
+      if (reason === 'source-text' || ruleIds.length === 0) {
+        const key = `reason:${reason}`;
+        const bucket = buckets.get(key) ?? { key, reason, lineIds: [] };
+        bucket.lineIds.push(line.id);
+        buckets.set(key, bucket);
+      } else {
+        for (const ruleId of ruleIds) {
+          const key = `${reason}:${ruleId}`;
+          const bucket = buckets.get(key) ?? { key, ruleId, reason, lineIds: [] };
+          bucket.lineIds.push(line.id);
+          buckets.set(key, bucket);
+        }
+      }
+    }
+  }
+
+  const sortedBuckets = [...buckets.values()].sort(
+    (a, b) => reasonOrder.indexOf(a.reason) - reasonOrder.indexOf(b.reason) || b.lineIds.length - a.lineIds.length,
+  );
+  const affectedRuleCount = new Set(recheckLines.flatMap((line) => line.recheckRuleIds ?? [])).size;
+  const lineNumber = (lineId: string) => lines.findIndex((line) => line.id === lineId) + 1;
+
+  return (
+    <div class="recheck-summary">
+      <div class="recheck-summary-head">
+        <span class="recheck-pulse" aria-hidden="true" />
+        <div>
+          <strong>规则变更待复核</strong>
+          <p>{recheckLines.length} 行盲文结果已变，涉及 {affectedRuleCount} 条规则；逐行重新批准后才能记录新版本。</p>
+        </div>
+      </div>
+      <div class="recheck-bucket-list">
+        {sortedBuckets.map((bucket) => (
+          <button class="recheck-bucket" key={bucket.key} onClick={() => onJump(bucket.lineIds[0])}>
+            <span class={`recheck-chip ${bucket.reason}`}>{recheckReasonLabel(bucket.reason)}</span>
+            <span class="recheck-bucket-rule">
+              {bucket.ruleId ? ruleSourceLabel(bucket.ruleId, ruleSets, activeRuleSetId) : '原文/跨行调整'}
+            </span>
+            <span class="recheck-bucket-count">{bucket.lineIds.length} 行</span>
+          </button>
+        ))}
+      </div>
+      <div class="recheck-line-numbers">
+        第 {recheckLines.map((line) => lineNumber(line.id)).join('、')} 行
+      </div>
+    </div>
+  );
+}
+
 function IssuesPanel({
   issues,
   lines,
+  ruleSets,
+  activeRuleSetId,
   onJump,
   onResolve,
   onBatchFix,
 }: {
   issues: ProofIssue[];
   lines: TextbookLine[];
+  ruleSets: RuleSet[];
+  activeRuleSetId: string;
   onJump: (lineId: string) => void;
   onResolve: (issueId: string) => void;
   onBatchFix: (ruleId: string) => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
+  const recheckLines = lines.filter((line) => line.status === 'recheck');
   const grouped = useMemo(() => {
     const map = new Map<string, ProofIssue[]>();
     unresolved.forEach((item) => {
@@ -399,7 +544,8 @@ function IssuesPanel({
 
   return (
     <div class="inspector-body">
-      {grouped.length === 0 && <div class="empty-state"><span>✓</span><strong>没有未处理问题</strong><p>可以记录版本或导出打印稿。</p></div>}
+      <RecheckSummary lines={lines} ruleSets={ruleSets} activeRuleSetId={activeRuleSetId} onJump={onJump} />
+      {recheckLines.length === 0 && grouped.length === 0 && <div class="empty-state"><span>✓</span><strong>没有未处理问题</strong><p>可以记录版本或导出打印稿。</p></div>}
       {grouped.map(([key, group]) => {
         const lineNumbers = group.map((item) => lines.findIndex((line) => line.id === item.lineId) + 1).join('、');
         return (
@@ -454,13 +600,19 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
   );
 }
 
-function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; onSnapshot: () => void; onRestore: (version: VersionSnapshot) => void }) {
+function VersionsPanel({ state, recheckCount, onSnapshot, onRestore }: { state: ProjectState; recheckCount: number; onSnapshot: () => void; onRestore: (version: VersionSnapshot) => void }) {
   return (
     <div class="inspector-body">
-      <div class="snapshot-callout">
+      <div class={`snapshot-callout ${recheckCount > 0 ? 'locked' : ''}`}>
         <div><strong>本地版本记录</strong><p>保存当前规则、原文、状态和备注的完整快照。</p></div>
-        <md-filled-button onClick={onSnapshot}>记录版本</md-filled-button>
+        <md-filled-button onClick={onSnapshot} disabled={recheckCount > 0}>记录版本</md-filled-button>
       </div>
+      {recheckCount > 0 && (
+        <div class="version-lock-note">
+          <strong>还有 {recheckCount} 行规则变更待复核</strong>
+          <p>盲文结果已变的已批准行需要逐行重新批准或改判其他状态，全部处理完才能记录新版本。未变化的批准结果会继续保留。</p>
+        </div>
+      )}
       {state.versions.length === 0 && <div class="empty-state compact"><strong>还没有版本快照</strong><p>完成一轮校对后记录版本，便于比较和恢复。</p></div>}
       <div class="timeline">
         {state.versions.map((version) => (
@@ -488,7 +640,15 @@ export default function App() {
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
+  const recheckCount = state.lines.filter((line) => line.status === 'recheck').length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
+
+  // 规则变更产生待复核行时，把右侧切到问题页，确保老师看到受影响汇总
+  const recheckCountRef = useRef(0);
+  useEffect(() => {
+    if (recheckCount > recheckCountRef.current) setInspectorTab('issues');
+    recheckCountRef.current = recheckCount;
+  }, [recheckCount]);
 
   const selectLine = (lineId: string, scroll = false) => {
     commit('切换当前行', (current) => ({ ...current, selectedLineId: lineId }));
@@ -501,7 +661,30 @@ export default function App() {
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
     commit('更新校对状态', (current) => {
-      const lines = current.lines.map((line) => line.id === lineId ? { ...line, status } : line);
+      const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
+      const lines = current.lines.map((line) => {
+        if (line.id !== lineId) return line;
+        if (status === 'approved') {
+          // 批准：留存当时的转写依据，退出待复核
+          return {
+            ...line,
+            status,
+            approvalBasis: captureApprovalBasis(line, ruleSet),
+            recheckReasons: undefined,
+            recheckRuleIds: undefined,
+            recheckAt: undefined,
+          };
+        }
+        // 改成其他状态（含处理完待复核）：批准依据作废，后续规则变化不再把它拉回复核
+        return {
+          ...line,
+          status,
+          approvalBasis: undefined,
+          recheckReasons: undefined,
+          recheckRuleIds: undefined,
+          recheckAt: undefined,
+        };
+      });
       const issues = current.issues.map((item) => item.lineId === lineId && status === 'approved' ? { ...item, resolved: true } : item);
       return { ...current, lines, issues, updatedAt: new Date().toISOString() };
     });
@@ -560,6 +743,11 @@ export default function App() {
   };
 
   const recordVersion = (action = '手动记录') => {
+    const pending = state.lines.filter((line) => line.status === 'recheck').length;
+    if (pending > 0) {
+      setInspectorTab('issues');
+      return;
+    }
     commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
   };
 
@@ -638,6 +826,7 @@ export default function App() {
           <div><strong>{progress}%</strong><span>已批准 {approvedCount}/{state.lines.length} 行</span></div>
           <md-linear-progress value={progress / 100} aria-label="校对进度" />
         </div>
+        <div class={`status-stat ${recheckCount > 0 ? 'warning' : ''}`}><strong>{recheckCount}</strong><span>变更待复核</span></div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
@@ -688,14 +877,16 @@ export default function App() {
 
         <aside class="right-panel">
           <div class="inspector-tabs" role="tablist">
-            <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
+            <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {(unresolvedCount + recheckCount) > 0 && <span class={recheckCount > 0 ? 'badge-alert' : ''}>{unresolvedCount + recheckCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
-            <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
+            <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {recheckCount > 0 ? <span class="badge-alert">{recheckCount}</span> : state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
             <IssuesPanel
               issues={state.issues}
               lines={state.lines}
+              ruleSets={state.ruleSets}
+              activeRuleSetId={state.activeRuleSetId}
               onJump={(lineId) => selectLine(lineId, true)}
               onResolve={(issueId) => commit('标记问题已处理', (current) => ({ ...current, issues: current.issues.map((item) => item.id === issueId ? { ...item, resolved: true } : item) }))}
               onBatchFix={batchFixRule}
@@ -707,7 +898,7 @@ export default function App() {
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
             }));
           }} />}
-          {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
+          {inspectorTab === 'versions' && <VersionsPanel state={state} recheckCount={recheckCount} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}

@@ -1,7 +1,9 @@
 import type {
+  ApprovalBasis,
   BrailleToken,
   ProofIssue,
   ProjectState,
+  RecheckReason,
   RuleSet,
   TextbookLine,
   TranscriptionRule,
@@ -161,6 +163,36 @@ function issue(
   };
 }
 
+export function brailleOfTokens(tokens: BrailleToken[]): string {
+  return tokens.map((token) => token.braille).join('');
+}
+
+/** 捕获批准一行时的转写依据：规则集设置、实际用到的规则快照和当时盲文结果 */
+export function captureApprovalBasis(line: TextbookLine, ruleSet: RuleSet): ApprovalBasis {
+  const usedRuleMap = new Map<string, TranscriptionRule>();
+  for (const token of line.tokens) {
+    if (token.ruleId) {
+      const rule = ruleSet.rules.find((item) => item.id === token.ruleId);
+      if (rule && !usedRuleMap.has(rule.id)) usedRuleMap.set(rule.id, rule);
+    }
+  }
+  return {
+    ruleSetId: ruleSet.id,
+    contractions: ruleSet.contractions,
+    hyphenMode: ruleSet.hyphenMode,
+    source: line.source,
+    braille: brailleOfTokens(line.tokens),
+    usedRules: [...usedRuleMap.values()].map((rule) => ({
+      id: rule.id,
+      source: rule.source,
+      output: rule.output,
+      enabled: rule.enabled,
+    })),
+    continuesPrevious: line.continuesPrevious,
+    approvedAt: new Date().toISOString(),
+  };
+}
+
 function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: TextbookLine; issues: ProofIssue[] } {
   const issues: ProofIssue[] = [];
   const tokenText = line.tokens.map((token) => token.braille).join('');
@@ -194,7 +226,7 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   }
 
   if (issues.some((item) => item.severity === 'error')) {
-    nextLine.status = 'questionable';
+    if (nextLine.status !== 'approved' && nextLine.status !== 'recheck') nextLine.status = 'questionable';
   } else if (issues.length > 0 && nextLine.status === 'unchecked') {
     nextLine.status = 'questionable';
   }
@@ -202,23 +234,144 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   return { line: nextLine, issues };
 }
 
+/** 比对批准依据与当前规则集，给出打回复核的原因类别和涉及规则 */
+function classifyRuleDrift(
+  basis: ApprovalBasis,
+  currentSet: RuleSet,
+  currentTokens: BrailleToken[],
+): { reasons: RecheckReason[]; ruleIds: string[] } {
+  const reasons = new Set<RecheckReason>();
+  const ruleIds = new Set<string>();
+  const recorded = new Map(basis.usedRules.map((rule) => [rule.id, rule]));
+
+  // 逐规则比对批准快照与当前规则：停用/启用、原文（匹配方式）、输出
+  for (const oldRule of basis.usedRules) {
+    const currentRule = currentSet.rules.find((rule) => rule.id === oldRule.id);
+    if (!currentRule) {
+      // 规则被删除，匹配方式不再相同
+      reasons.add('source-rule');
+      ruleIds.add(oldRule.id);
+      continue;
+    }
+    if (currentRule.enabled !== oldRule.enabled) {
+      reasons.add('toggle');
+      ruleIds.add(currentRule.id);
+    }
+    if (currentRule.source !== oldRule.source) {
+      reasons.add('source-rule');
+      ruleIds.add(currentRule.id);
+    }
+    if (currentRule.output !== oldRule.output) {
+      reasons.add('output');
+      ruleIds.add(currentRule.id);
+    }
+  }
+
+  // 当前行用到、但批准快照里没有的规则：新规则开始参与或新启用的规则
+  for (const token of currentTokens) {
+    if (!token.ruleId) continue;
+    if (!recorded.has(token.ruleId)) {
+      const currentRule = currentSet.rules.find((rule) => rule.id === token.ruleId);
+      if (!currentRule) continue;
+      if (currentRule.kind === 'contraction') {
+        reasons.add('toggle');
+      } else {
+        reasons.add('source-rule');
+      }
+      ruleIds.add(currentRule.id);
+    }
+  }
+
+  // 缩写总开关变化：影响缩写规则是否参与转写
+  if (currentSet.contractions !== basis.contractions) {
+    reasons.add('toggle');
+    currentSet.rules
+      .filter((rule) => rule.kind === 'contraction')
+      .forEach((rule) => ruleIds.add(rule.id));
+  }
+
+  // 跨行连字符模式变化：影响行尾连字符的输出
+  if (currentSet.hyphenMode !== basis.hyphenMode) {
+    reasons.add('output');
+  }
+
+  return { reasons: [...reasons], ruleIds: [...ruleIds] };
+}
+
+/**
+ * 重新转录后复核批准状态：
+ * - 盲文结果与批准时完全一致的行继续保留批准；
+ * - 结果确实变化的已批准/待复核行回到待复核，并写明是原规则、输出、启停还是原文变化；
+ * - 待复核行若结果回到与批准依据一致，自动恢复批准。
+ */
+function revalidateApprovals(
+  state: ProjectState,
+  lines: TextbookLine[],
+  issues: ProofIssue[],
+): { lines: TextbookLine[]; issues: ProofIssue[] } {
+  const currentSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
+
+  const nextLines = lines.map((line) => {
+    const basis = line.approvalBasis;
+    if (!basis || (line.status !== 'approved' && line.status !== 'recheck')) return line;
+
+    const currentBraille = brailleOfTokens(line.tokens);
+    const sameText = line.source === basis.source && line.continuesPrevious === basis.continuesPrevious;
+
+    // 结果与批准依据一致：继续批准（含待复核行恢复批准的情况）
+    if (sameText && currentBraille === basis.braille) {
+      return { ...line, status: 'approved' as const, recheckReasons: undefined, recheckRuleIds: undefined, recheckAt: undefined };
+    }
+
+    const reasons = new Set<RecheckReason>();
+    const ruleIds = new Set<string>();
+
+    if (!sameText) {
+      // 原文或跨行接续关系被直接编辑
+      reasons.add('source-text');
+    }
+
+    if (currentBraille !== basis.braille) {
+      const drift = classifyRuleDrift(basis, currentSet, line.tokens);
+      drift.reasons.forEach((reason) => reasons.add(reason));
+      drift.ruleIds.forEach((id) => ruleIds.add(id));
+    }
+
+    return {
+      ...line,
+      status: 'recheck' as const,
+      recheckReasons: [...reasons],
+      recheckRuleIds: [...ruleIds],
+      recheckAt: line.status === 'recheck' ? (line.recheckAt ?? new Date().toISOString()) : new Date().toISOString(),
+    };
+  });
+
+  // 保留批准的行，其旧问题不再挂账；待复核行的问题保持未解决等待处理
+  const approvedIds = new Set(nextLines.filter((line) => line.status === 'approved' && line.approvalBasis).map((line) => line.id));
+  const nextIssues = issues.map((item) => (approvedIds.has(item.lineId) ? { ...item, resolved: true } : item));
+
+  return { lines: nextLines, issues: nextIssues };
+}
+
 export function analyzeProject(state: ProjectState): ProjectState {
   const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
-  const nextLines: TextbookLine[] = [];
+  const transcribedLines: TextbookLine[] = [];
   const issues: ProofIssue[] = [];
 
   state.lines.forEach((line, index) => {
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
     const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
     const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
-    nextLines.push(analyzed.line);
+    transcribedLines.push(analyzed.line);
     issues.push(...analyzed.issues);
   });
 
+  const revalidated = revalidateApprovals(state, transcribedLines, issues);
+
   return {
     ...state,
-    lines: nextLines,
-    issues,
+    lines: revalidated.lines,
+    issues: revalidated.issues,
     lastCheckedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
