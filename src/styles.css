@@ -139,6 +139,44 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .line-status.questionable { background: #d68a1f; }
 .line-status.reviewed { background: #5c86a5; }
 .line-status.approved { background: #3d8a64; box-shadow: 0 0 0 3px #dcefe5; }
+.line-status.recheck { background: #c2410c; box-shadow: 0 0 0 0 rgba(194,65,12,.5); animation: recheck-pulse 1.8s ease-out infinite; }
+@keyframes recheck-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(194,65,12,.45); }
+  70% { box-shadow: 0 0 0 6px rgba(194,65,12,0); }
+  100% { box-shadow: 0 0 0 0 rgba(194,65,12,0); }
+}
+
+.recheck-banner { margin-top: 9px; padding: 9px 11px 10px; border: 1px solid #e7b08a; border-left: 4px solid #c2410c; border-radius: 8px; background: #fff6ef; }
+.recheck-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.recheck-head strong { color: #9a3412; font-size: 12px; }
+.recheck-reasons { display: flex; gap: 4px; flex-wrap: wrap; }
+.reason-chip { padding: 2px 7px; border-radius: 9px; background: #ffe4d2; color: #8c2f0b; font-size: 10px; white-space: nowrap; }
+.recheck-diff { margin-top: 7px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.recheck-diff small { display: block; margin-bottom: 2px; color: var(--muted); font-size: 9px; }
+.recheck-diff code { display: block; min-height: 22px; padding: 4px 6px; border-radius: 5px; background: white; border: 1px solid #efd9c8; font: 14px/1.3 "Apple Braille", "Segoe UI Symbol", sans-serif; word-break: break-all; }
+.recheck-actions { margin-top: 8px; display: flex; justify-content: flex-end; gap: 4px; }
+
+.approval-basis { margin-top: 8px; padding: 6px 8px; display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; border-radius: 7px; background: #edf7f3; color: #315e48; font-size: 10px; }
+.approval-basis .basis-icon { color: #3d8a64; }
+.approval-basis details { flex-basis: 100%; }
+.approval-basis summary { cursor: pointer; color: #47705f; font-size: 10px; }
+.basis-detail code { display: block; margin-top: 5px; padding: 4px 6px; border-radius: 5px; background: white; border: 1px solid #cfe2d8; font: 14px/1.3 "Apple Braille", "Segoe UI Symbol", sans-serif; word-break: break-all; }
+.basis-detail ul { margin: 6px 0 2px; padding-left: 16px; color: #43544e; }
+.basis-detail li { font-size: 10px; line-height: 1.7; }
+.basis-detail li small { color: var(--muted); }
+
+.recheck-summary { padding: 12px; margin-bottom: 10px; border-radius: 10px; border: 1px solid #e7b08a; background: #fff6ef; }
+.recheck-summary strong { color: #9a3412; font-size: 13px; }
+.recheck-summary p { margin: 6px 0 0; color: #a35a33; font-size: 10px; line-height: 1.5; }
+.recheck-lines { margin-top: 8px; border-top: 1px dashed #e3c9b4; padding-top: 7px; display: flex; flex-direction: column; gap: 4px; }
+.recheck-line { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+.recheck-line-no { color: #9a3412; font-size: 10px; white-space: nowrap; }
+.recheck-line-source { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4b5753; font-size: 11px; }
+.recheck-line-actions { display: flex; gap: 2px; }
+.review-badge { background: #d97742 !important; color: #fff !important; }
+.status-stat.recheck-stat { background: transparent; text-align: left; cursor: pointer; font: inherit; }
+.status-stat.recheck-stat:not(.active) { color: inherit; cursor: default; }
+.status-stat.recheck-stat.active strong { color: #c2410c; }
 .line-body { min-width: 0; padding: 12px 14px 13px; }
 .line-source { display: flex; align-items: flex-start; gap: 10px; }
 .line-source textarea {
@@ -166,7 +204,7 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .issue-chip.info { color: #315e70; background: #e2f3f8; }
 .note-field { margin-top: 9px; --md-outlined-text-field-container-height: 42px; }
 
-.inspector-tabs { height: 50px; display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--line); background: white; }
+.inspector-tabs { height: 50px; display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); background: white; }
 .inspector-tabs button { border: 0; border-bottom: 2px solid transparent; background: transparent; cursor: pointer; color: #697671; font-size: 12px; }
 .inspector-tabs button.active { color: #244f43; border-bottom-color: #39715f; font-weight: 700; }
 .inspector-tabs span { display: inline-grid; place-items: center; min-width: 18px; height: 18px; margin-left: 4px; padding: 0 4px; border-radius: 9px; background: #f2c477; color: #553500; font-size: 10px; }
